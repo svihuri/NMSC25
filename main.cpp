@@ -410,7 +410,6 @@ int main() {
         
         if (step % outputInterval == 0) {
             solver.writeToFile(outputFile, time, step);
-            solver.print_vspace_sum();
         }
         time += dt;
         step++;
@@ -421,7 +420,6 @@ int main() {
         solver.solve();
         if (step % outputInterval == 0) {
             solver.writeToFile(outputFile, time, step);
-            solver.print_vspace_sum();
         }
         time += dt;
         step++;
