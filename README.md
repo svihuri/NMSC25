@@ -2,6 +2,6 @@ Final project for NMSC 2025 by Saana Vihuri. Modular C++ version of Jos Stam's s
 
 How to compile and run: <br>
  
- g++ main.cpp -O3 -lfftw3f -o main \\
- ./main \\
+ g++ main.cpp -O3 -lfftw3f -o main <br>
+ ./main <br>
  python3 plot_simulation.py
