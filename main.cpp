@@ -9,9 +9,7 @@
 #include <iomanip> 
 #include <string>
 #include <algorithm> 
-
-
-constexpr float PI = 3.14159265358979323846f;
+#include <stdexcept> 
 
 /* 
 2D FluidSolver by Saana Vihuri (2025) based on Jos Stam's stable fluid solver (https://www.dgp.toronto.edu/public_user/stam/reality/Research/pdf/jgt01.pdf).
@@ -22,24 +20,26 @@ Building blocks for the solver (add forces, advect, diffuse, project) are taken 
 Main changes:
 1. Class FluidSolver is implemented to encapsulate the solver and its parameters.
 2. Class constructor and destructor handle memory allocation and deallocation for FFTW.
-3. Arrays and other data structures are not reused and named according to their purpose.
+3. Arrays and other data structures are not reused for different things and named according to their purpose.
 4. FFT is not done in-place
 
 to do: make non-copyable and non-movable? 
 note: Stam's code uses single precision floats so we use float instead of double
 */
 
+constexpr float PI = 3.14159265358979323846f;
+
+
+/* parameters:                                                                                                    
+ * gridSize:  size of the grid (n x n)                                                                  
+ * viscosity: viscosity of the fluid                                                                    
+ * timestep:  time step for the simulation                                                              
+ * logfile:   log file stream for logging                                                              
+ */    
 class FluidSolver {
 public:
     FluidSolver(const int gridSize, const float viscosity, const float timestep, std::ofstream& logfile)
         : n(gridSize), visc(viscosity), dt(timestep), logFile(logfile) {
-        /* 
-        parameters:
-        n: grid size (n x n)
-        visc: viscosity
-        dt: time step
-        logFile: log file stream
-        */
 
         // FFT transformation is not done in-place, so no need for padding
         int size = n * n;
@@ -55,8 +55,6 @@ public:
         // allocate buffers for FFT
         u_freq = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * fft_size);    
         v_freq = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * fft_size);
-        u_fft = (float*)fftwf_malloc(sizeof(float) * size);        
-        v_fft = (float*)fftwf_malloc(sizeof(float) * size);
 
         // initialize current velocity fields to zero
         std::fill(u_now, u_now + size, 0.0f);
@@ -65,23 +63,29 @@ public:
         // initialise dye field (for visualisation)
         D_now.resize(size);
         D_prev.resize(size);
+        std::fill(D_now.begin(), D_now.end(), 0.0f);
+        std::fill(D_prev.begin(), D_prev.end(), 0.0f);
 
         // create FFTW plans (initialisation)
         // in and out arrays are specified as the transformation is not in-place
-        u_plan_fwd = fftwf_plan_dft_r2c_2d(n, n, u_fft, u_freq, FFTW_ESTIMATE);
-        v_plan_fwd = fftwf_plan_dft_r2c_2d(n, n, v_fft, v_freq, FFTW_ESTIMATE);
-        u_plan_bwd = fftwf_plan_dft_c2r_2d(n, n, u_freq, u_fft, FFTW_ESTIMATE);
-        v_plan_bwd = fftwf_plan_dft_c2r_2d(n, n, v_freq, v_fft, FFTW_ESTIMATE);
+        u_plan_fwd = fftwf_plan_dft_r2c_2d(n, n, u_now, u_freq, FFTW_ESTIMATE);
+        v_plan_fwd = fftwf_plan_dft_r2c_2d(n, n, v_now, v_freq, FFTW_ESTIMATE);
+        u_plan_bwd = fftwf_plan_dft_c2r_2d(n, n, u_freq, u_now, FFTW_ESTIMATE);
+        v_plan_bwd = fftwf_plan_dft_c2r_2d(n, n, v_freq, v_now, FFTW_ESTIMATE);
 
         // allocate for external forces
         f_x = (float*)fftwf_malloc(sizeof(float) * size);
         f_y = (float*)fftwf_malloc(sizeof(float) * size);
-        
         // initialise to zero, default setting
         std::fill(f_x, f_x + size, 0.0f);
         std::fill(f_y, f_y + size, 0.0f);
 
-        writeLog(logFile, "FluidSolver initialized successfully");
+        if (!u_now || !v_now || !u_prev || !v_prev || !u_freq || !v_freq || !f_x || !f_y) {
+            throw std::runtime_error("Memory allocation failed");
+        }
+        else {
+            writeLog(logFile, "FluidSolver initialized successfully");
+        }
         
     }
 
@@ -95,36 +99,37 @@ public:
         fftwf_free(u_now);  fftwf_free(v_now);
         fftwf_free(u_prev); fftwf_free(v_prev);
         fftwf_free(u_freq); fftwf_free(v_freq);
-        fftwf_free(u_fft);  fftwf_free(v_fft);
         fftwf_free(f_x);    fftwf_free(f_y);
     }
-     
+
+
+    /* solve() runs one simulation step and has 4 main parts:
+    1. addForces: add external forces to the velocity fields (spatial domain)
+    2. advect: semi-Lagrangian advection step (spatial domain)
+    3. performFFT: do FFT on velocity fields depending on direction  
+    4. applyViscosityAndProject: apply viscosity and project velocity field to conserve mass (frequency domain)
+    */
      void solve() {
-        /*solve runs one simulation step and has 4 main parts:
-        1. addForces: add external forces to the velocity fields (spatial domain)
-        2. advect: semi-Lagrangian advection step (spatial domain)
-        3. performFFT: do FFT on velocity fields depending on direction  
-        4. applyViscosityAndProject: apply viscosity and project velocity field to conserve mass (frequency domain)
-        */
         if (count == 1) {
             writeLog(logFile, "Solver started");
         }
         addForces();
         advect();
-        copyToFFT(u_now, u_fft);
-        copyToFFT(v_now, v_fft);
-        performFFT(FFTDirection::Forward, u_fft, u_freq, u_plan_fwd);
-        performFFT(FFTDirection::Forward, v_fft, v_freq, v_plan_fwd);
+        performFFT(FFTDirection::Forward, u_now, u_freq, u_plan_fwd);
+        performFFT(FFTDirection::Forward, v_now, v_freq, v_plan_fwd);
         applyViscosityAndProject();
-        performFFT(FFTDirection::Inverse, u_fft, u_freq, u_plan_bwd);
-        performFFT(FFTDirection::Inverse, v_fft, v_freq, v_plan_bwd);
-        normalize();
+        performFFT(FFTDirection::Inverse, u_now, u_freq, u_plan_bwd);
+        performFFT(FFTDirection::Inverse, v_now, v_freq, v_plan_bwd);
+        normalise();
         count++;
 
     }
+    /* Apply external force field.
+     * mode: choose force field. 0 = set external forces to zero, 1 = set external forces from assignment, 2 = push from above and below.
+     * U0, delta, A, sigma, k: parameters for the force field.
+     * if not called, force fields are initialised to zero.
+    */
     void setExternalForces(int mode, float U0, float delta, float A, float sigma, float k) {
-        // if not called, default is zero
-        // mode 0: set external forces to zero, 1: set external forces from assignment
         if (mode == 0) {
             std::fill(f_x, f_x + n * n, 0.0f);
             std::fill(f_y, f_y + n * n, 0.0f);
@@ -138,18 +143,52 @@ public:
                     f_y[i + n * j] = A * sinf(2*PI*k*x_i) * expf(-((y_j-0.5f)*(y_j-0.5f))/(2*sigma*sigma));     
             }
         }
-        writeLog(logFile, "External forces set with mode " + std::to_string(mode));
-        
+        else if (mode == 2) {
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++) {
+                    float y_j = ((float)j+0.5f) / n;
+                    float x_i = ((float)i+0.5f) / n;
+                    // interval for the force
+                    if ((x_i > 0.47) && (x_i < 0.53) && (y_j < 0.25f)) { 
+                        f_x[i + n * j] = 0.0f; 
+                        f_y[i + n * j] = 5.0;     
+                    }
+                    else {
+                        f_x[i + n * j] = 0.0f;
+                        f_y[i + n * j] = 0.0f;
+                    }
+        }
+        writeLog(logFile, "External forces set with mode " + std::to_string(mode));   
     }
-    void setInitialDyeField() {
-        // set initial dye field (for visualisation)
-        for (int i = 0; i < n; ++i) {
-            for (int j = 0; j < n; ++j) {
-                float y_j = ((float)j+0.5f) / n;
-                if (y_j < 0.5f) {
-                    D_now[i + n * j] = 0.0f; 
-                } else {
-                    D_now[i + n * j] = 1.0f; 
+}
+
+    /* Set initial dye field to visualise the motion of fluid.
+     * mode: choose dye field. 1 = assignment field, 2 = ball in the middle.
+     * if not called, dye field is initialised to zero everywhere.
+    */
+    void setInitialDyeField(int mode) {
+        if (mode == 1) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < n; ++j) {
+                    float y_j = ((float)j+0.5f) / n;
+                    if (y_j < 0.5f) {
+                        D_now[i + n * j] = 0.0f; 
+                    } else {
+                        D_now[i + n * j] = 1.0f; 
+                    }
+                }
+            }
+        }   
+        else if (mode == 2) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < n; ++j) {
+                    float x_i = ((float)i+0.5f) / n;
+                    float y_j = ((float)j+0.5f) / n;
+                    if (sqrt((x_i-0.5f)*(x_i-0.5f)+(y_j-0.5f)*(y_j-0.5f)) < 0.1f) {
+                        D_now[i + n * j] = 1.0f; 
+                    } else {
+                        D_now[i + n * j] = 0.0f; 
+                    }
                 }
             }
         }
@@ -167,25 +206,6 @@ public:
                      << u_now[idx] << ";" << v_now[idx] << ";" << D_now[idx] << "\n";
             }
         }
-        // writing timestep
-        std::ofstream timestepfile;
-        timestepfile.open("timestep", std::ios::app);
-
-        timestepfile << time << "\n";
-
-        timestepfile.close();
-
-        std::ofstream Dfile;
-        Dfile.open("D", std::ios::app);
-
-        for (int i = 0; i<n; i++) {
-            for (int j = 0; j<n; j++) {
-                Dfile << D_now[i + n * j] << " ";
-            }
-        }
-
-        Dfile << "\n";
-        Dfile.close();
     }
 
 private:
@@ -206,9 +226,7 @@ private:
     float* u_now;
     float* v_now;
     float* u_prev;
-    float* v_prev;
-    float* u_fft;             
-    float* v_fft;            
+    float* v_prev;           
     float* f_x;            
     float* f_y;             
     
@@ -283,20 +301,6 @@ private:
                              s * ((1 - t) * D_prev[i1 + n * j0] + t * D_prev[i1 + n * j1]);
             }
         }
-        // for (i = 0; i < n; i++)
-        // for (j = 0; j < n; j++)
-        // {
-        //     D_prev[i + n * j] = D_now[i + n * j];
-        // }
-    }
-
-    void copyToFFT(float* spatial_data, float* fft) {
-        // copy real data to FFTW buffer
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < n; j++) {
-                fft[i + n * j] = spatial_data[i + n * j];
-            }
-        }
     }
 
     enum class FFTDirection { Forward = 1, Inverse = -1 };
@@ -349,14 +353,14 @@ private:
         }
     }
 
-    // normalize result after inverse FFT
-    void normalize() {
+    // normalise result after inverse FFT
+    void normalise() {
         float f;
         f = 1.0 / (n * n);
         for (int i = 0; i < n; i++)
             for (int j = 0; j < n; j++) {
-                u_now[i + n * j] = f * u_fft[i + n * j];
-                v_now[i + n * j] = f * v_fft[i + n * j];
+                u_now[i + n * j] = f * u_now[i + n * j];
+                v_now[i + n * j] = f * v_now[i + n * j];
                 
             }
     }
@@ -366,12 +370,13 @@ private:
 int main() {
     // simulation parameters
     const int n = 500;                       // grid size (n x n)
-    const float viscosity = 0.001;           // viscosity
+    const float viscosity = 0.001;             // viscosity
     const float dt = 0.01;                   // time step
     float time = 0.0f;
     int step = 0;
     const int maxSteps = 500;
-    const int forceSteps = 10; // number of steps to apply external forces
+    const int forceSteps = 10;  // number of steps to apply external forces
+    int dyeMode = 1;            // dye field mode (1 = assignment field, 2 = ball in the middle)   
     
     // force field parameters
     const float U0 = 5.0f;
@@ -381,10 +386,10 @@ int main() {
     const float k = 4.0f;
 
     // output file and log file parameters & initialisation
-    int outputInterval = 10;
+    int outputInterval = 5;
     int logInterval = 10;
     std::ofstream logFile;
-    std::string logFilename = "log.txt";
+    std::string logFilename = "../run/output/log.txt";
     logFile.open(logFilename);
     logFile << "FluidSolver log" << std::endl;
     logFile << "Total simulation time: " << maxSteps * dt << " seconds" << std::endl;
@@ -392,20 +397,19 @@ int main() {
     logFile << "Grid size: " << n << " x " << n << std::endl;
     logFile << "Viscosity: " << viscosity << std::endl;
     std::ofstream outputFile;
-    std::string filename = "output.csv";
+    std::string filename =  "../run/output/output.csv";
     outputFile.open(filename);
     outputFile << "time;step;i;j;u;v;D" << std::endl;       
      
 
-    //--- the main simulation loop ---
+    //--- the simulation ---
     FluidSolver solver(n, viscosity, dt, logFile);
     
-    solver.setInitialDyeField(); 
+    solver.setInitialDyeField(dyeMode); 
 
-    // first, run the simulation with external forces applied
-    // note the mode of setting external forces (0 = set to zero, 1 = apply force from assignment)
-    solver.setExternalForces(1, U0, delta, A, sigma, k);
-    while (step < forceSteps) {
+    // first, run the simulation with external forces applied for forceSteps
+    solver.setExternalForces(1, U0, delta, A, sigma, k);            
+    while (step <= forceSteps) {
         solver.solve();
         
         if (step % outputInterval == 0) {
@@ -415,8 +419,8 @@ int main() {
         step++;
     }
     // then, run the simulation without external forces
-    solver.setExternalForces(0, U0, delta, A, sigma, k);
-    while (step < maxSteps) {
+    solver.setExternalForces(0, U0, delta, A, sigma, k);    
+    while (step <= maxSteps) {
         solver.solve();
         if (step % outputInterval == 0) {
             solver.writeToFile(outputFile, time, step);
@@ -427,7 +431,8 @@ int main() {
 
     outputFile.close();
     logFile.close();
-    std::cout << "Simulation completed. Output written to " << filename << std::endl;
+    std::cout << "Simulation completed." << std::endl;
+    std::cout << "Output written to " << filename << std::endl;
     std::cout << "Log file written to " << logFilename << std::endl;
     return 0;
 }
