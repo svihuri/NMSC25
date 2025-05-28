@@ -10,6 +10,7 @@ Simulation sample, Kelvin-Helmholtz instability in 2D:
 
 git clone https://github.com/svihuri/NMSC25.git <br>
 cd NMSC25/ <br>
+cd src/ <br>
 
  g++ main.cpp -O3 -lfftw3f -o main <br>
  ./main <br>
